@@ -1,0 +1,16 @@
+# =============================================================================
+# NodeGroup для подключения внешних узлов к Managed Kubernetes
+# =============================================================================
+apiVersion: mks.yandex.cloud/v1alpha1
+kind: NodeGroup
+metadata:
+  name: external-workers
+  namespace: yandex-system
+spec:
+  ips:
+    - 10.0.4.20
+    - 10.0.5.33
+  provisionBySsh:
+    sshKeySecret:
+      name: external-node-ssh-key
+      namespace: yandex-system

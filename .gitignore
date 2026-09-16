@@ -1,0 +1,14 @@
+# Секреты
+sa-key.json
+ssh-key
+*.key
+*.pem
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

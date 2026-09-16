@@ -1,0 +1,157 @@
+# =============================================================================
+# Workflow для применения Kubernetes-манифестов
+# =============================================================================
+name: K8s Apply
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'kubernetes/**'
+  workflow_dispatch:
+
+jobs:
+  apply:
+    name: Apply manifests
+    runs-on: ubuntu-latest
+    steps:
+      # ----------------------------------------------------------------------
+      # 1. Checkout
+      # ----------------------------------------------------------------------
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Cache YC CLI
+        id: cache-yc
+        uses: actions/cache@v4
+        with:
+          path: ~/yandex-cloud
+          key: ${{ runner.os }}-yc-cli-v1
+          restore-keys: |
+            ${{ runner.os }}-yc-cli-
+
+      # Устанавливаем YC CLI только если не нашли в кэше
+      - name: Install YC CLI
+        if: steps.cache-yc.outputs.cache-hit != 'true'
+        run: |
+          echo "Кэш YC CLI не найден — устанавливаем..."
+          curl -sSL https://storage.yandexcloud.net/yandexcloud-yc/install.sh | \
+            bash -s -- -i $HOME/yandex-cloud -n
+
+      # Добавляем YC CLI в PATH (всегда, независимо от кэша)
+      - name: Add YC CLI to PATH
+        run: echo "$HOME/yandex-cloud/bin" >> $GITHUB_PATH
+
+      # Кэшируем установленный бинарник kubectl
+      - name: Cache kubectl
+        id: cache-kubectl
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/bin/kubectl
+          key: ${{ runner.os }}-kubectl-v1.31.0
+          restore-keys: |
+            ${{ runner.os }}-kubectl-
+
+      - name: Install kubectl
+        if: steps.cache-kubectl.outputs.cache-hit != 'true'
+        run: |
+          echo "Кэш kubectl не найден — устанавливаем..."
+          mkdir -p ~/.local/bin
+          curl -sSL -o ~/.local/bin/kubectl \
+            "https://storage.googleapis.com/kubernetes-release/release/v1.31.0/bin/linux/amd64/kubectl"
+          chmod +x ~/.local/bin/kubectl
+
+      - name: Add kubectl to PATH
+        run: echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Cache kubectl discovery
+        uses: actions/cache@v4
+        with:
+          path: ~/.kube/cache
+          key: ${{ runner.os }}-kube-discovery-${{ github.run_id }}
+          restore-keys: |
+            ${{ runner.os }}-kube-discovery-
+
+      # ----------------------------------------------------------------------
+      # 5. Подготовка секретов
+      # ----------------------------------------------------------------------
+      - name: Write Service Account Key
+        run: |
+          echo '${{ secrets.YC_SERVICE_ACCOUNT_KEY_B64 }}' | base64 -d > ${{ github.workspace }}/sa-key.json
+          chmod 600 ${{ github.workspace }}/sa-key.json
+
+      - name: Write SSH Private Key
+        run: |
+          echo '${{ secrets.YC_SSH_PRIVATE_KEY_B64 }}' | base64 -d > ${{ github.workspace }}/ssh-key
+          chmod 600 ${{ github.workspace }}/ssh-key
+
+      # ----------------------------------------------------------------------
+      # 6. Получаем kubeconfig кластера
+      # ----------------------------------------------------------------------
+      - name: Get Kubeconfig
+        run: |
+          yc version
+          kubectl version --client
+          CLUSTER_ID=$(yc managed-kubernetes cluster list --format json | jq -r '.[0].id')
+          yc managed-kubernetes cluster get-credentials --id "$CLUSTER_ID" --external --force
+          kubectl cluster-info
+        env:
+          YC_SERVICE_ACCOUNT_KEY_FILE: ${{ github.workspace }}/sa-key.json
+
+      # ----------------------------------------------------------------------
+      # 7. Создаём SSH-секрет (идемпотентно)
+      # ----------------------------------------------------------------------
+      - name: Create SSH Secret
+        run: |
+          kubectl -n yandex-system create secret generic external-node-ssh-key \
+            --from-file=ssh-privatekey=${{ github.workspace }}/ssh-key \
+            --type=kubernetes.io/ssh-auth \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      # ----------------------------------------------------------------------
+      # 8. Применяем манифест NodeGroup
+      # ----------------------------------------------------------------------
+      - name: Apply NodeGroup
+        run: |
+          kubectl apply -f kubernetes/external-nodes/nodegroup.yaml
+
+      # ----------------------------------------------------------------------
+      # 9. Ждём, пока узлы перейдут в статус Ready
+      # ----------------------------------------------------------------------
+      - name: Wait for Nodes Ready
+        run: |
+          echo "Ожидание подключения узлов (до 15 минут)..."
+          for i in $(seq 1 30); do
+            READY=$(kubectl get nodes --no-headers 2>/dev/null | grep -c " Ready " || echo 0)
+            echo "Попытка $i/30: $READY узлов Ready"
+            if [ "$READY" -ge 2 ]; then
+              echo ""
+              echo "=== Все узлы подключены! ==="
+              kubectl get nodes -o wide
+              exit 0
+            fi
+            sleep 30
+          done
+
+          echo ""
+          echo "=== Таймаут ==="
+          kubectl get nodes || true
+          echo ""
+          echo "--- NodeGroup status: ---"
+          kubectl -n yandex-system describe nodegroup external-workers || true
+          echo ""
+          echo "--- События: ---"
+          kubectl -n yandex-system get events --sort-by='.lastTimestamp' | tail -30
+          exit 1
+
+      # ----------------------------------------------------------------------
+      # 10. Итоговое состояние
+      # ----------------------------------------------------------------------
+      - name: Show Cluster State
+        if: always()
+        run: |
+          echo "=== Узлы ==="
+          kubectl get nodes -o wide || true
+          echo ""
+          echo "=== Поды по namespace ==="
+          kubectl get pods -A || true
