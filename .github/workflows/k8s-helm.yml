@@ -1,19 +1,19 @@
 # =============================================================================
-# Workflow для применения Kubernetes-манифестов
+# Workflow для установки Helm-чартов
 # =============================================================================
-name: K8s Apply
+name: K8s Helm
 
 on:
   push:
     branches: [main]
     paths:
-      - 'external-nodes/**'
-      - '.github/workflows/k8s-apply.yml'
+      - 'helm/**'
+      - '.github/workflows/k8s-helm.yml'
   workflow_dispatch:
 
 jobs:
-  apply:
-    name: Apply manifests
+  helm:
+    name: helm upgrade --install
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -58,18 +58,27 @@ jobs:
       - name: Add kubectl to PATH
         run: echo "$HOME/.local/bin" >> $GITHUB_PATH
 
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.14.0
+
+      - name: Cache Helm
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/helm
+            ~/.config/helm
+          key: ${{ runner.os }}-helm-${{ hashFiles('helm/**') }}
+          restore-keys: ${{ runner.os }}-helm-
+
       # ----------------------------------------------------------------------
-      # Секреты
+      # Секреты и kubeconfig
       # ----------------------------------------------------------------------
       - name: Write Service Account Key
         run: |
           echo '${{ secrets.YC_SERVICE_ACCOUNT_KEY_B64 }}' | base64 -d > ${{ github.workspace }}/sa-key.json
           chmod 600 ${{ github.workspace }}/sa-key.json
-
-      - name: Write SSH Private Key
-        run: |
-          echo '${{ secrets.YC_SSH_PRIVATE_KEY_B64 }}' | base64 -d > ${{ github.workspace }}/ssh-key
-          chmod 600 ${{ github.workspace }}/ssh-key
 
       - name: Configure YC CLI
         run: |
@@ -86,41 +95,42 @@ jobs:
           kubectl cluster-info
 
       # ----------------------------------------------------------------------
-      # SSH-секрет для кластера
+      # Установка Ingress NGINX
       # ----------------------------------------------------------------------
-      - name: Create SSH Secret
+      - name: Install Ingress NGINX
         run: |
-          kubectl -n yandex-system create secret generic external-node-ssh-key \
-            --from-file=ssh-privatekey=${{ github.workspace }}/ssh-key \
-            --type=kubernetes.io/ssh-auth \
-            --dry-run=client -o yaml | kubectl apply -f -
+          helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+          helm repo update
+          helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
+            -n ingress-nginx --create-namespace \
+            -f helm/ingress-nginx-values.yaml \
+            --wait --timeout 10m
 
-      # ----------------------------------------------------------------------
-      # Применение NodeGroup
-      # ----------------------------------------------------------------------
-      - name: Apply NodeGroup
+      - name: Wait for LoadBalancer IP
         run: |
-          kubectl apply -f external-nodes/nodegroup.yaml
-
-      - name: Wait for Nodes Ready
-        run: |
-          echo "Ожидание подключения узлов (до 15 минут)..."
+          echo "Ожидание внешнего IP LoadBalancer (до 5 минут)..."
           for i in $(seq 1 30); do
-            READY=$(kubectl get nodes --no-headers 2>/dev/null | grep -c " Ready " || true)
-            READY=${READY:-0}
-            echo "Попытка $i/30: $READY узлов Ready"
-            if [ "$READY" -ge 2 ]; then
-              kubectl get nodes -o wide
+            IP=$(kubectl get svc ingress-nginx-controller -n ingress-nginx \
+                 -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
+            if [ -n "$IP" ]; then
+              echo "=== Ingress Controller доступен по IP: $IP ==="
               exit 0
             fi
-            sleep 30
+            echo "Попытка $i/30: IP пока не назначен"
+            sleep 10
           done
-          kubectl get nodes || true
-          kubectl -n yandex-system describe nodegroup external-workers || true
+          echo "Таймаут ожидания IP."
+          kubectl get svc -n ingress-nginx
           exit 1
 
-      - name: Show Cluster State
+      - name: Show Final State
         if: always()
         run: |
-          kubectl get nodes -o wide || true
-          kubectl get pods -A || true
+          echo "=== Поды ingress-nginx ==="
+          kubectl get pods -n ingress-nginx -o wide || true
+          echo ""
+          echo "=== Сервисы ingress-nginx ==="
+          kubectl get svc -n ingress-nginx || true
+          echo ""
+          echo "=== IngressClass ==="
+          kubectl get ingressclass || true
