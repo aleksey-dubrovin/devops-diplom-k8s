@@ -85,19 +85,25 @@ jobs:
           echo '${{ secrets.YC_SSH_PRIVATE_KEY_B64 }}' | base64 -d > ${{ github.workspace }}/ssh-key
           chmod 600 ${{ github.workspace }}/ssh-key
 
+      - name: Configure YC CLI
+        run: |
+          yc config profile create ci-profile
+          yc config set service-account-key ${{ github.workspace }}/sa-key.json
+          yc config set cloud-id ${{ secrets.YC_CLOUD_ID }}
+          yc config set folder-id ${{ secrets.YC_FOLDER_ID }}
+          yc config profile activate ci-profile
+          echo "YC CLI настроен:"
+          yc config list
+
       # ----------------------------------------------------------------------
       # 6. Получаем kubeconfig кластера
       # ----------------------------------------------------------------------
       - name: Get Kubeconfig
         run: |
-          yc version
-          kubectl version --client
           CLUSTER_ID=$(yc managed-kubernetes cluster list --format json | jq -r '.[0].id')
           yc managed-kubernetes cluster get-credentials --id "$CLUSTER_ID" --external --force
           kubectl cluster-info
-        env:
-          YC_SERVICE_ACCOUNT_KEY_FILE: ${{ github.workspace }}/sa-key.json
-
+          
       # ----------------------------------------------------------------------
       # 7. Создаём SSH-секрет (идемпотентно)
       # ----------------------------------------------------------------------
