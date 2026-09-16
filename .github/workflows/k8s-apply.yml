@@ -119,7 +119,7 @@ jobs:
       # ----------------------------------------------------------------------
       - name: Apply NodeGroup
         run: |
-          kubectl apply -f kubernetes/external-nodes/nodegroup.yaml
+          kubectl apply -f external-nodes/nodegroup.yaml
 
       # ----------------------------------------------------------------------
       # 9. Ждём, пока узлы перейдут в статус Ready
