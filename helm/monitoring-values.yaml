@@ -1,199 +1,65 @@
-# -----------------------------------------------------------------------------
-# Prometheus
-# -----------------------------------------------------------------------------
 prometheus:
   enabled: true
   prometheusSpec:
-    retention: 7d                    
-    retentionSize: "8GB"
-    storageSpec:
-      volumeClaimTemplate:
-        spec:
-          storageClassName: yc-network-hdd
-          accessModes: ["ReadWriteOnce"]
-          resources:
-            requests:
-              storage: 10Gi
-    resources:
-      requests:
-        cpu: 200m
-        memory: 512Mi
-      limits:
-        cpu: 800m
-        memory: 1Gi
-    serviceMonitorSelectorNilUsesHelmValues: false
-    podMonitorSelectorNilUsesHelmValues: false
-    probeSelectorNilUsesHelmValues: false
-  
-    nodeSelector:
-      kubernetes.io/os: linux
-    tolerations:
-      - operator: Exists
+    retention: 6h
+    retentionSize: "3GB"
+    storageSpec: {}  
 
-# -----------------------------------------------------------------------------
-# Alertmanager
-# -----------------------------------------------------------------------------
+    resources:
+      requests: { cpu: 200m, memory: 512Mi }
+      limits:   { cpu: 800m, memory: 1Gi }
+
+grafana:
+  enabled: true
+  adminPassword: "Pass123QWE"
+  persistence:
+    enabled: false 
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits:   { cpu: 300m, memory: 384Mi }
+
 alertmanager:
   enabled: true
   alertmanagerSpec:
-    storage:
-      volumeClaimTemplate:
-        spec:
-          storageClassName: yc-network-hdd
-          accessModes: ["ReadWriteOnce"]
-          resources:
-            requests:
-              storage: 2Gi
+    storage: {}    
     resources:
-      requests:
-        cpu: 50m
-        memory: 64Mi
-      limits:
-        cpu: 200m
-        memory: 128Mi
+      requests: { cpu: 50m, memory: 64Mi }
+      limits:   { cpu: 200m, memory: 128Mi }
   config:
-    global:
-      resolve_timeout: 5m
     route:
       group_by: ['alertname', 'namespace']
       group_wait: 10s
       group_interval: 5m
       repeat_interval: 4h
       receiver: 'default'
-      routes:
-        - match:
-            severity: critical
-          receiver: 'default'
     receivers:
       - name: 'default'
         webhook_configs:
           - url: 'http://max-bot.default.svc.cluster.local:8080/webhook'
             send_resolved: true
-            http_config:
-              follow_redirects: true
 
-# -----------------------------------------------------------------------------
-# Grafana
-# -----------------------------------------------------------------------------
-grafana:
-  enabled: true
-  adminPassword: "Pass123qwe"
-  persistence:
-    enabled: true
-    storageClassName: yc-network-hdd
-    size: 3Gi
-  resources:
-    requests:
-      cpu: 100m
-      memory: 128Mi
-    limits:
-      cpu: 300m
-      memory: 384Mi
-
-  service:
-    type: ClusterIP
-    port: 80
-
-  ingress:
-    enabled: false
-
-  defaultDashboardsEnabled: true
-  defaultDashboardsTimezone: browser
-  grafana.ini:
-    server:
-      root_url: "%(protocol)s://%(domain)s/"
-    analytics:
-      reporting_enabled: false
-      check_for_updates: false
-
-# -----------------------------------------------------------------------------
-# Node Exporter (сбор метрик с узлов)
-# -----------------------------------------------------------------------------
-nodeExporter:
-  enabled: true
-  resources:
-    requests:
-      cpu: 50m
-      memory: 64Mi
-    limits:
-      cpu: 200m
-      memory: 128Mi
-
-# -----------------------------------------------------------------------------
-# Kube State Metrics (метрики объектов k8s)
-# -----------------------------------------------------------------------------
-kubeStateMetrics:
-  enabled: true
-
-# -----------------------------------------------------------------------------
-# Prometheus Operator
-# -----------------------------------------------------------------------------
 prometheusOperator:
   enabled: true
-  resources:
-    requests:
-      cpu: 50m
-      memory: 128Mi
-    limits:
-      cpu: 200m
-      memory: 256Mi
-
   admissionWebhooks:
     enabled: false
   tls:
     enabled: false
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits:   { cpu: 200m, memory: 256Mi }
 
-# -----------------------------------------------------------------------------
-# Отключаем лишние компоненты (экономия ресурсов)
-# -----------------------------------------------------------------------------
+nodeExporter:
+  enabled: true
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits:   { cpu: 200m, memory: 128Mi }
+
+kubeStateMetrics:
+  enabled: true
 
 kubeEtcd:
   enabled: false
-
 kubeScheduler:
   enabled: false
-
 kubeControllerManager:
   enabled: false
-
-kubeProxy:
-  enabled: true
-
-kubelet:
-  enabled: true
-
-coreDns:
-  enabled: true
-
-# -----------------------------------------------------------------------------
-# Стандартные правила алертов — отключаем шумные
-# -----------------------------------------------------------------------------
-defaultRules:
-  create: true
-  rules:
-    alertmanager: true
-    etcd: false
-    configReloaders: true
-    general: true
-    k8s: true
-    kubeApiserver: true
-    kubeApiserverAvailability: true
-    kubeApiserverBurnrate: true
-    kubeApiserverHistogram: true
-    kubeApiserverSlos: true
-    kubelet: true
-    kubeProxy: true
-    kubePrometheusGeneral: true
-    kubePrometheusNodeRecording: true
-    kubernetesApps: true
-    kubernetesResources: true
-    kubernetesStorage: true
-    kubernetesSystem: true
-    kubeScheduler: false
-    kubeControllerManager: false
-    network: true
-    node: true
-    nodeExporterAlerting: true
-    nodeExporterRecording: true
-    prometheus: true
-    prometheusOperator: true
