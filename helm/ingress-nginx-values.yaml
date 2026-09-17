@@ -1,14 +1,46 @@
+# =============================================================================
+# Values для NGINX Ingress Controller
+# =============================================================================
+
 controller:
+  admissionWebhooks:
+    enabled: false
+  replicaCount: 2
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+
   service:
     type: NodePort
-    # Cluster — чтобы health check работал с любого узла,
-    # даже если пода ingress там нет
     externalTrafficPolicy: Cluster
-
-    # Фиксируем порты, чтобы NLB в Terraform знал их заранее
     nodePorts:
       http: 30080
       https: 30443
 
-  replicaCount: 2
-  # ... остальные настройки без изменений
+  # Размещаем реплики на разных узлах
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/name: ingress-nginx
+
+  # Настройки NGINX
+  config:
+    ssl-redirect: "true"
+    force-ssl-redirect: "true"
+    use-forwarded-headers: "true"
+    proxy-body-size: "10m"
+
+  # Метрики для Prometheus
+  metrics:
+    enabled: true
+    serviceMonitor:
+      enabled: false
