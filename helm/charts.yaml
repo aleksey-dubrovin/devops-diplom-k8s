@@ -26,5 +26,5 @@ charts:
     namespace: monitoring
     createNamespace: true
     valuesFile: helm/monitoring-values.yaml
-    timeout: 20m
+    timeout: 30m
     enabled: true
