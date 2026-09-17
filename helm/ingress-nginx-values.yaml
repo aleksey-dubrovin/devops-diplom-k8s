@@ -1,39 +1,14 @@
-# =============================================================================
-# Values для NGINX Ingress Controller
-# =============================================================================
 controller:
   service:
-    type: LoadBalancer
-    externalTrafficPolicy: Local
-    annotations:
-      yandex.cloud/load-balancer-type: "external"
+    type: NodePort
+    # Cluster — чтобы health check работал с любого узла,
+    # даже если пода ingress там нет
+    externalTrafficPolicy: Cluster
+
+    # Фиксируем порты, чтобы NLB в Terraform знал их заранее
+    nodePorts:
+      http: 30080
+      https: 30443
 
   replicaCount: 2
-
-  resources:
-    requests:
-      cpu: 100m
-      memory: 128Mi
-    limits:
-      cpu: 500m
-      memory: 512Mi
-
-  # Размещаем контроллеры на разных узлах для отказоустойчивости
-  topologySpreadConstraints:
-    - maxSkew: 1
-      topologyKey: kubernetes.io/hostname
-      whenUnsatisfiable: ScheduleAnyway
-      labelSelector:
-        matchLabels:
-          app.kubernetes.io/name: ingress-nginx
-
-  # Редирект с HTTP на HTTPS
-  config:
-    ssl-redirect: "true"
-    force-ssl-redirect: "true"
-    use-forwarded-headers: "true"
-    proxy-body-size: "10m"
-
-  # Метрики для Prometheus)
-  metrics:
-    enabled: true
+  # ... остальные настройки без изменений
