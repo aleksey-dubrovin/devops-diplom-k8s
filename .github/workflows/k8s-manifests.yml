@@ -96,26 +96,46 @@ jobs:
         if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         run: |
           set -euo pipefail
-          REGISTRY=config/secrets/registry.yaml
-          [ ! -f "$REGISTRY" ] && echo "Реестр не найден" && exit 0
 
-          yq -o=json '.secrets[]' "$REGISTRY" > /tmp/secrets.jsonl
-          [ ! -s /tmp/secrets.jsonl ] && echo "Секретов нет" && exit 0
+          REGISTRY=config/secrets/registry.yaml
+          if [ ! -f "$REGISTRY" ]; then
+            echo "Реестр не найден: $REGISTRY — пропускаем"
+            exit 0
+          fi
+
+          # ВАЖНО: -I=0 — indent 0, компактный JSON одной строкой на объект
+          yq -o=json -I=0 '.secrets[]' "$REGISTRY" > /tmp/secrets.jsonl 2>/dev/null || true
+          if [ ! -s /tmp/secrets.jsonl ]; then
+            echo "Секретов в реестре нет — пропускаем"
+            exit 0
+          fi
+
+          echo "=== Файл /tmp/secrets.jsonl ==="
+          cat /tmp/secrets.jsonl
+          echo ""
+
+          CREATED=0
+          SKIPPED=0
 
           while read -r SECRET; do
             [ -z "$SECRET" ] && continue
-            NAME=$(echo "$SECRET" | jq -r '.name')
-            NS=$(echo "$SECRET" | jq -r '.namespace')
-            TYPE=$(echo "$SECRET" | jq -r '.type // "Opaque"')
-            echo "=== Secret: $NAME ($NS) ==="
 
-            if ! kubectl get ns "$NS" &>/dev/null; then
-              echo "  ⏭  namespace $NS не найден — пропуск"
+            NAME=$(echo "$SECRET" | jq -r '.name')
+            NAMESPACE=$(echo "$SECRET" | jq -r '.namespace')
+            TYPE=$(echo "$SECRET" | jq -r '.type // "Opaque"')
+
+            echo ""
+            echo "=== Secret: $NAME (namespace: $NAMESPACE) ==="
+
+            if ! kubectl get ns "$NAMESPACE" &>/dev/null; then
+              echo "  ⏭  namespace '$NAMESPACE' не найден — пропуск"
+              SKIPPED=$((SKIPPED+1))
               continue
             fi
 
             ARGS=()
             while read -r KEY; do
+              [ -z "$KEY" ] && continue
               KEY_NAME=$(echo "$KEY" | jq -r '.name')
               FROM_ENV=$(echo "$KEY" | jq -r '.fromEnv // empty')
               LITERAL=$(echo "$KEY" | jq -r '.value // empty')
@@ -123,21 +143,35 @@ jobs:
               if [ -n "$FROM_ENV" ]; then
                 VAR_NAME="SECRET_${FROM_ENV}"
                 VALUE="${!VAR_NAME:-}"
-                [ -z "$VALUE" ] && echo "  ⚠  $VAR_NAME пуст" && continue
+                if [ -z "$VALUE" ]; then
+                  echo "  ⚠  env $VAR_NAME пуст — ключ '$KEY_NAME' пропущен"
+                  continue
+                fi
                 ARGS+=("--from-literal=${KEY_NAME}=${VALUE}")
+                echo "  ✓ $KEY_NAME ← env:$VAR_NAME"
               elif [ -n "$LITERAL" ]; then
                 ARGS+=("--from-literal=${KEY_NAME}=${LITERAL}")
+                echo "  ✓ $KEY_NAME ← literal"
               fi
             done < <(echo "$SECRET" | jq -c '.keys[]')
 
-            [ ${#ARGS[@]} -eq 0 ] && echo "  ⏭  нет значений" && continue
+            if [ ${#ARGS[@]} -eq 0 ]; then
+              echo "  ⏭  нет значений — Secret не создаётся"
+              SKIPPED=$((SKIPPED+1))
+              continue
+            fi
 
-            kubectl create secret generic "$NAME" -n "$NS" --type="$TYPE" \
-              "${ARGS[@]}" --dry-run=client -o yaml | kubectl apply -f -
-            echo "  ✓ создан/обновлён"
+            kubectl create secret generic "$NAME" \
+              -n "$NAMESPACE" --type="$TYPE" \
+              "${ARGS[@]}" \
+              --dry-run=client -o yaml | kubectl apply -f -
+            CREATED=$((CREATED+1))
           done < /tmp/secrets.jsonl
 
-      # ===== PR: dry-run =====
+          echo ""
+          echo "=== Итог: создано $CREATED, пропущено $SKIPPED ==="
+
+            # ===== PR: dry-run =====
       - name: Diff Manifests (PR)
         if: github.event_name == 'pull_request'
         run: |
