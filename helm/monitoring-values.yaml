@@ -11,9 +11,12 @@ prometheus:
 
 grafana:
   enabled: true
-  adminPassword: "Pass123QWE"
+  admin:
+    existingSecret: grafana-admin
+    userKey: admin-user
+    passwordKey: admin-password
   persistence:
-    enabled: false 
+    enabled: false
   resources:
     requests: { cpu: 100m, memory: 128Mi }
     limits:   { cpu: 300m, memory: 384Mi }

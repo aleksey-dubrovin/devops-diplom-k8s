@@ -1,0 +1,32 @@
+# =============================================================================
+# Ingress для Grafana
+# =============================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: grafana
+  namespace: monitoring
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      proxy_set_header X-Forwarded-Proto $scheme;
+      proxy_set_header X-Forwarded-Host  $host;
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - monitoring.dubrovins.ru
+      secretName: wildcard-dubrovins-tls
+  rules:
+    - host: monitoring.dubrovins.ru
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: prometheus-grafana
+                port:
+                  number: 80

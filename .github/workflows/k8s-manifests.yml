@@ -1,0 +1,158 @@
+name: K8s Manifests
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'config/**'
+      - '.github/workflows/k8s-manifests.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'config/**'
+      - '.github/workflows/k8s-manifests.yml'
+  workflow_dispatch:
+
+jobs:
+  apply:
+    name: ${{ github.event_name == 'pull_request' && 'Diff (dry-run)' || 'Apply manifests' }}
+    runs-on: ubuntu-latest
+
+    env:
+        SECRET_GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
+        SECRET_WILDCARD_TLS_CRT: ${{ secrets.WILDCARD_TLS_CRT }}
+        SECRET_WILDCARD_TLS_KEY: ${{ secrets.WILDCARD_TLS_KEY }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ===== Кэш YC CLI =====
+      - name: Cache YC CLI
+        id: cache-yc
+        uses: actions/cache@v4
+        with:
+          path: ~/yandex-cloud
+          key: ${{ runner.os }}-yc-cli-v1
+          restore-keys: ${{ runner.os }}-yc-cli-
+
+      - name: Install YC CLI
+        if: steps.cache-yc.outputs.cache-hit != 'true'
+        run: |
+          curl -sSL https://storage.yandexcloud.net/yandexcloud-yc/install.sh | \
+            bash -s -- -i $HOME/yandex-cloud -n
+
+      - name: Add YC CLI to PATH
+        run: echo "$HOME/yandex-cloud/bin" >> $GITHUB_PATH
+
+      # ===== Кэш kubectl =====
+      - name: Cache kubectl
+        id: cache-kubectl
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/bin/kubectl
+          key: ${{ runner.os }}-kubectl-v1.31.0
+          restore-keys: ${{ runner.os }}-kubectl-
+
+      - name: Install kubectl
+        if: steps.cache-kubectl.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/.local/bin
+          curl -sSL -o ~/.local/bin/kubectl \
+            "https://storage.googleapis.com/kubernetes-release/release/v1.31.0/bin/linux/amd64/kubectl"
+          chmod +x ~/.local/bin/kubectl
+
+      - name: Add kubectl to PATH
+        run: echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq \
+            https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+      # ===== Kubeconfig =====
+      - name: Write Service Account Key
+        run: |
+          echo '${{ secrets.YC_SERVICE_ACCOUNT_KEY_B64 }}' | base64 -d > ${{ github.workspace }}/sa-key.json
+          chmod 600 ${{ github.workspace }}/sa-key.json
+
+      - name: Configure YC CLI
+        run: |
+          yc config profile create ci-profile
+          yc config set service-account-key ${{ github.workspace }}/sa-key.json
+          yc config set cloud-id ${{ secrets.YC_CLOUD_ID }}
+          yc config set folder-id ${{ secrets.YC_FOLDER_ID }}
+          yc config profile activate ci-profile
+
+      - name: Get Kubeconfig
+        run: |
+          CLUSTER_ID=$(yc managed-kubernetes cluster list --format json | jq -r '.[0].id')
+          yc managed-kubernetes cluster get-credentials --id "$CLUSTER_ID" --external --force
+          kubectl cluster-info
+
+      # ===== Секреты из реестра =====
+      - name: Create Secrets from Registry
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+          REGISTRY=config/secrets/registry.yaml
+          [ ! -f "$REGISTRY" ] && echo "Реестр не найден" && exit 0
+
+          yq -o=json '.secrets[]' "$REGISTRY" > /tmp/secrets.jsonl
+          [ ! -s /tmp/secrets.jsonl ] && echo "Секретов нет" && exit 0
+
+          while read -r SECRET; do
+            [ -z "$SECRET" ] && continue
+            NAME=$(echo "$SECRET" | jq -r '.name')
+            NS=$(echo "$SECRET" | jq -r '.namespace')
+            TYPE=$(echo "$SECRET" | jq -r '.type // "Opaque"')
+            echo "=== Secret: $NAME ($NS) ==="
+
+            if ! kubectl get ns "$NS" &>/dev/null; then
+              echo "  ⏭  namespace $NS не найден — пропуск"
+              continue
+            fi
+
+            ARGS=()
+            while read -r KEY; do
+              KEY_NAME=$(echo "$KEY" | jq -r '.name')
+              FROM_ENV=$(echo "$KEY" | jq -r '.fromEnv // empty')
+              LITERAL=$(echo "$KEY" | jq -r '.value // empty')
+
+              if [ -n "$FROM_ENV" ]; then
+                VAR_NAME="SECRET_${FROM_ENV}"
+                VALUE="${!VAR_NAME:-}"
+                [ -z "$VALUE" ] && echo "  ⚠  $VAR_NAME пуст" && continue
+                ARGS+=("--from-literal=${KEY_NAME}=${VALUE}")
+              elif [ -n "$LITERAL" ]; then
+                ARGS+=("--from-literal=${KEY_NAME}=${LITERAL}")
+              fi
+            done < <(echo "$SECRET" | jq -c '.keys[]')
+
+            [ ${#ARGS[@]} -eq 0 ] && echo "  ⏭  нет значений" && continue
+
+            kubectl create secret generic "$NAME" -n "$NS" --type="$TYPE" \
+              "${ARGS[@]}" --dry-run=client -o yaml | kubectl apply -f -
+            echo "  ✓ создан/обновлён"
+          done < /tmp/secrets.jsonl
+
+      # ===== PR: dry-run =====
+      - name: Diff Manifests (PR)
+        if: github.event_name == 'pull_request'
+        run: |
+          kubectl diff -f config/ingress/ -R || true
+          kubectl apply --dry-run=server -f config/ingress/ -R
+
+      # ===== Main: apply =====
+      - name: Apply Manifests (main)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          kubectl apply -f config/ingress/ -R
+          # config/app/ добавим позже
+
+      - name: Show Final State
+        if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        run: |
+          kubectl get ingress -A || true
+          kubectl get secrets -A | grep wildcard || true
