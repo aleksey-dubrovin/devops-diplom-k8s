@@ -1,0 +1,17 @@
+# =============================================================================
+# Реестр Helm-чартов для установки в кластер
+# =============================================================================
+
+charts:
+  # ---------------------------------------------------------------------------
+  # NGINX Ingress Controller
+  # ---------------------------------------------------------------------------
+  - release: ingress-nginx
+    repoName: ingress-nginx
+    repo: https://kubernetes.github.io/ingress-nginx
+    chart: ingress-nginx/ingress-nginx
+    namespace: ingress-nginx
+    createNamespace: true
+    valuesFile: helm/ingress-nginx-values.yaml
+    timeout: 15m
+    enabled: true

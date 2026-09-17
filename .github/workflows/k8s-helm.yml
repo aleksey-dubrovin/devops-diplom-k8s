@@ -1,5 +1,5 @@
 # =============================================================================
-# Workflow для установки Helm-чартов
+# Универсальный workflow для установки Helm-чартов
 # =============================================================================
 name: K8s Helm
 
@@ -10,18 +10,26 @@ on:
       - 'helm/**'
       - '.github/workflows/k8s-helm.yml'
   workflow_dispatch:
+    inputs:
+      only:
+        description: 'Установить только один чарт (release из charts.yaml). Пусто = все enabled.'
+        required: false
+        default: ''
 
 jobs:
   helm:
-    name: helm upgrade --install
+    name: Install Helm charts from registry
     runs-on: ubuntu-latest
     steps:
+      # ======================================================================
+      # 1. Checkout
+      # ======================================================================
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # ----------------------------------------------------------------------
-      # Кэширование
-      # ----------------------------------------------------------------------
+      # ======================================================================
+      # 2. Кэширование утилит
+      # ======================================================================
       - name: Cache YC CLI
         id: cache-yc
         uses: actions/cache@v4
@@ -63,18 +71,26 @@ jobs:
         with:
           version: v3.14.0
 
-      - name: Cache Helm
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq \
+            https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+          yq --version
+
+      - name: Cache Helm repos
         uses: actions/cache@v4
         with:
           path: |
             ~/.cache/helm
             ~/.config/helm
           key: ${{ runner.os }}-helm-${{ hashFiles('helm/**') }}
-          restore-keys: ${{ runner.os }}-helm-
+          restore-keys: |
+            ${{ runner.os }}-helm-
 
-      # ----------------------------------------------------------------------
-      # Секреты и kubeconfig
-      # ----------------------------------------------------------------------
+      # ======================================================================
+      # 3. Секреты и kubeconfig
+      # ======================================================================
       - name: Write Service Account Key
         run: |
           echo '${{ secrets.YC_SERVICE_ACCOUNT_KEY_B64 }}' | base64 -d > ${{ github.workspace }}/sa-key.json
@@ -94,43 +110,108 @@ jobs:
           yc managed-kubernetes cluster get-credentials --id "$CLUSTER_ID" --external --force
           kubectl cluster-info
 
-      # ----------------------------------------------------------------------
-      # Установка Ingress NGINX
-      # ----------------------------------------------------------------------
-      - name: Install Ingress NGINX
+      # ======================================================================
+      # 4. Основной шаг — установка всех чартов из реестра
+      # ======================================================================
+      - name: Install Charts from Registry
+        env:
+          ONLY: ${{ github.event.inputs.only }}
         run: |
-          helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+          set -euo pipefail
+
+          # --- 4.1. Читаем реестр и фильтруем ---
+          if [ -n "$ONLY" ]; then
+            echo "Режим: только чарт '$ONLY'"
+            FILTER=".charts | map(select(.release == \"$ONLY\"))"
+          else
+            echo "Режим: все enabled чарты"
+            FILTER='.charts | map(select(.enabled != false))'
+          fi
+
+          CHARTS=$(yq "$FILTER" helm/charts.yaml -o=json)
+          COUNT=$(echo "$CHARTS" | jq 'length')
+          echo "Найдено чартов: $COUNT"
+          echo "$CHARTS" | jq -r '.[] | "  - \(.release) (\(.chart)) → \(.namespace)"'
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "Нет чартов для установки — выходим"
+            exit 0
+          fi
+
+          # --- 4.2. Добавляем все репозитории один раз ---
+          echo "$CHARTS" | jq -r '.[] | "\(.repoName)|\(.repo)"' | sort -u > /tmp/repos.txt
+          while IFS='|' read -r REPO_NAME REPO_URL; do
+            echo "helm repo add $REPO_NAME"
+            helm repo add "$REPO_NAME" "$REPO_URL" 2>/dev/null || true
+          done < /tmp/repos.txt
           helm repo update
-          helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
-            -n ingress-nginx --create-namespace \
-            -f helm/ingress-nginx-values.yaml \
-            --wait --timeout 10m
 
-      - name: Wait for LoadBalancer IP
-        run: |
-          echo "Ожидание внешнего IP LoadBalancer (до 5 минут)..."
-          for i in $(seq 1 30); do
-            IP=$(kubectl get svc ingress-nginx-controller -n ingress-nginx \
-                 -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
-            if [ -n "$IP" ]; then
-              echo "=== Ingress Controller доступен по IP: $IP ==="
-              exit 0
+          # --- 4.3. Устанавливаем чарты по порядку ---
+          echo "$CHARTS" | jq -c '.[]' > /tmp/charts.jsonl
+
+          while read -r CHART; do
+            RELEASE=$(echo "$CHART" | jq -r '.release')
+            CHART_NAME=$(echo "$CHART" | jq -r '.chart')
+            NAMESPACE=$(echo "$CHART" | jq -r '.namespace')
+            VALUES=$(echo "$CHART" | jq -r '.valuesFile')
+            TIMEOUT=$(echo "$CHART" | jq -r '.timeout // "10m"')
+            CREATE_NS=$(echo "$CHART" | jq -r '.createNamespace // false')
+
+            echo ""
+            echo "============================================================"
+            echo "  Release:    $RELEASE"
+            echo "  Chart:      $CHART_NAME"
+            echo "  Namespace:  $NAMESPACE"
+            echo "  Values:     $VALUES"
+            echo "  Timeout:    $TIMEOUT"
+            echo "============================================================"
+
+            # Проверка, что values-файл существует
+            if [ ! -f "$VALUES" ]; then
+              echo "  ✗ Файл $VALUES не найден — пропускаем $RELEASE"
+              continue
             fi
-            echo "Попытка $i/30: IP пока не назначен"
-            sleep 10
-          done
-          echo "Таймаут ожидания IP."
-          kubectl get svc -n ingress-nginx
-          exit 1
 
+            # Cleanup: снимаем зависшие pending-* релизы
+            STATUS=$(helm status "$RELEASE" -n "$NAMESPACE" -o json 2>/dev/null | \
+                     jq -r '.info.status' || echo "not-found")
+            if [[ "$STATUS" == pending-* ]]; then
+              echo "  → Релиз завис ($STATUS) — удаляем"
+              helm uninstall "$RELEASE" -n "$NAMESPACE" --no-hooks || true
+              sleep 5
+            fi
+
+            # Флаг создания namespace
+            NS_FLAG=""
+            if [ "$CREATE_NS" = "true" ]; then
+              NS_FLAG="--create-namespace"
+            fi
+
+            # Установка
+            helm upgrade --install "$RELEASE" "$CHART_NAME" \
+              -n "$NAMESPACE" $NS_FLAG \
+              -f "$VALUES" \
+              --atomic \
+              --timeout "$TIMEOUT"
+
+            echo "  ✓ $RELEASE установлен"
+          done < /tmp/charts.jsonl
+
+      # ======================================================================
+      # 5. Итоговое состояние
+      # ======================================================================
       - name: Show Final State
         if: always()
         run: |
-          echo "=== Поды ingress-nginx ==="
-          kubectl get pods -n ingress-nginx -o wide || true
+          echo "=== Узлы ==="
+          kubectl get nodes -o wide || true
           echo ""
-          echo "=== Сервисы ingress-nginx ==="
-          kubectl get svc -n ingress-nginx || true
+          echo "=== Все поды ==="
+          kubectl get pods -A || true
           echo ""
-          echo "=== IngressClass ==="
-          kubectl get ingressclass || true
+          echo "=== Сервисы типа NodePort/LoadBalancer ==="
+          kubectl get svc -A --field-selector spec.type=NodePort || true
+          kubectl get svc -A --field-selector spec.type=LoadBalancer || true
+          echo ""
+          echo "=== Helm releases ==="
+          helm list -A || true
