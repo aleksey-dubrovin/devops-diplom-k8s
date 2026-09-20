@@ -1,16 +1,31 @@
+# =============================================================================
+# Workflow для применения внутренних ресурсов кластера
+# =============================================================================
+# Применяет: config/secrets/, config/service/, config/ingress/
+# Не применяет: config/app/ (обрабатывается workflow deploy.yml)
+#
+# Триггеры:
+#   - PR в main при изменениях в config/secrets, config/service, config/ingress
+#   - push в main при изменениях в тех же каталогах
+#   - workflow_dispatch
+# =============================================================================
 name: K8s Manifests
 
 on:
   pull_request:
     branches: [main]
     paths:
-      - 'config/**'
-      - '.github/workflows/k8s-manifests.yml'
+      - 'config/secrets/**'
+      - 'config/service/**'
+      - 'config/ingress/**'
+      - '.github/workflows/k8s-config.yml'
   push:
     branches: [main]
     paths:
-      - 'config/**'
-      - '.github/workflows/k8s-manifests.yml'
+      - 'config/secrets/**'
+      - 'config/service/**'
+      - 'config/ingress/**'
+      - '.github/workflows/k8s-config.yml'
   workflow_dispatch:
 
 jobs:
@@ -19,15 +34,15 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-        SECRET_GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
-        SECRET_WILDCARD_TLS_CRT: ${{ secrets.WILDCARD_TLS_CRT }}
-        SECRET_WILDCARD_TLS_KEY: ${{ secrets.WILDCARD_TLS_KEY }}
+      SECRET_GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
+      SECRET_WILDCARD_TLS_CRT:       ${{ secrets.WILDCARD_TLS_CRT }}
+      SECRET_WILDCARD_TLS_KEY:       ${{ secrets.WILDCARD_TLS_KEY }}
+      SECRET_REGISTRY_URL:           ${{ secrets.REGISTRY_URL }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # ===== Кэш YC CLI =====
       - name: Cache YC CLI
         id: cache-yc
         uses: actions/cache@v4
@@ -45,7 +60,6 @@ jobs:
       - name: Add YC CLI to PATH
         run: echo "$HOME/yandex-cloud/bin" >> $GITHUB_PATH
 
-      # ===== Кэш kubectl =====
       - name: Cache kubectl
         id: cache-kubectl
         uses: actions/cache@v4
@@ -71,7 +85,6 @@ jobs:
             https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
           sudo chmod +x /usr/local/bin/yq
 
-      # ===== Kubeconfig =====
       - name: Write Service Account Key
         run: |
           echo '${{ secrets.YC_SERVICE_ACCOUNT_KEY_B64 }}' | base64 -d > ${{ github.workspace }}/sa-key.json
@@ -91,7 +104,6 @@ jobs:
           yc managed-kubernetes cluster get-credentials --id "$CLUSTER_ID" --external --force
           kubectl cluster-info
 
-      # ===== Секреты из реестра =====
       - name: Create Secrets from Registry
         if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         run: |
@@ -99,36 +111,30 @@ jobs:
 
           REGISTRY=config/secrets/registry.yaml
           if [ ! -f "$REGISTRY" ]; then
-            echo "Реестр не найден: $REGISTRY — пропускаем"
+            echo "Реестр не найден, пропускаем"
             exit 0
           fi
 
-          # ВАЖНО: -I=0 — indent 0, компактный JSON одной строкой на объект
           yq -o=json -I=0 '.secrets[]' "$REGISTRY" > /tmp/secrets.jsonl 2>/dev/null || true
           if [ ! -s /tmp/secrets.jsonl ]; then
-            echo "Секретов в реестре нет — пропускаем"
+            echo "Секретов нет, пропускаем"
             exit 0
           fi
-
-          echo "=== Файл /tmp/secrets.jsonl ==="
-          cat /tmp/secrets.jsonl
-          echo ""
 
           CREATED=0
           SKIPPED=0
 
           while read -r SECRET; do
             [ -z "$SECRET" ] && continue
-
             NAME=$(echo "$SECRET" | jq -r '.name')
-            NAMESPACE=$(echo "$SECRET" | jq -r '.namespace')
+            NS=$(echo "$SECRET" | jq -r '.namespace')
             TYPE=$(echo "$SECRET" | jq -r '.type // "Opaque"')
 
             echo ""
-            echo "=== Secret: $NAME (namespace: $NAMESPACE) ==="
+            echo "Secret: $NAME (namespace: $NS)"
 
-            if ! kubectl get ns "$NAMESPACE" &>/dev/null; then
-              echo "  ⏭  namespace '$NAMESPACE' не найден — пропуск"
+            if ! kubectl get ns "$NS" &>/dev/null; then
+              echo "  namespace '$NS' не найден, пропуск"
               SKIPPED=$((SKIPPED+1))
               continue
             fi
@@ -144,49 +150,82 @@ jobs:
                 VAR_NAME="SECRET_${FROM_ENV}"
                 VALUE="${!VAR_NAME:-}"
                 if [ -z "$VALUE" ]; then
-                  echo "  ⚠  env $VAR_NAME пуст — ключ '$KEY_NAME' пропущен"
+                  echo "  переменная $VAR_NAME пуста, ключ '$KEY_NAME' пропущен"
                   continue
                 fi
                 ARGS+=("--from-literal=${KEY_NAME}=${VALUE}")
-                echo "  ✓ $KEY_NAME ← env:$VAR_NAME"
+                echo "  ключ $KEY_NAME взят из env:$VAR_NAME"
               elif [ -n "$LITERAL" ]; then
                 ARGS+=("--from-literal=${KEY_NAME}=${LITERAL}")
-                echo "  ✓ $KEY_NAME ← literal"
+                echo "  ключ $KEY_NAME задан литералом"
               fi
             done < <(echo "$SECRET" | jq -c '.keys[]')
 
             if [ ${#ARGS[@]} -eq 0 ]; then
-              echo "  ⏭  нет значений — Secret не создаётся"
+              echo "  нет значений, Secret не создаётся"
               SKIPPED=$((SKIPPED+1))
               continue
             fi
 
             kubectl create secret generic "$NAME" \
-              -n "$NAMESPACE" --type="$TYPE" \
+              -n "$NS" --type="$TYPE" \
               "${ARGS[@]}" \
               --dry-run=client -o yaml | kubectl apply -f -
             CREATED=$((CREATED+1))
           done < /tmp/secrets.jsonl
 
           echo ""
-          echo "=== Итог: создано $CREATED, пропущено $SKIPPED ==="
+          echo "Итог: создано $CREATED, пропущено $SKIPPED"
 
-            # ===== PR: dry-run =====
+      - name: Restart Grafana on Secret Update
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        run: |
+          if kubectl get secret grafana-admin -n monitoring &>/dev/null; then
+            kubectl rollout restart deployment prometheus-grafana -n monitoring
+            kubectl rollout status deployment prometheus-grafana -n monitoring --timeout=2m
+          fi
+
       - name: Diff Manifests (PR)
         if: github.event_name == 'pull_request'
         run: |
-          kubectl diff -f config/ingress/ -R || true
-          kubectl apply --dry-run=server -f config/ingress/ -R
+          for DIR in config/service config/ingress; do
+            if [ -d "$DIR" ] && ls "$DIR"/*.yaml &>/dev/null; then
+              echo "kubectl diff $DIR"
+              kubectl diff -f "$DIR/" -R || true
+              echo ""
+            fi
+          done
 
-      # ===== Main: apply =====
+          echo "kubectl apply --dry-run=server"
+          for DIR in config/service config/ingress; do
+            if [ -d "$DIR" ] && ls "$DIR"/*.yaml &>/dev/null; then
+              kubectl apply --dry-run=server -f "$DIR/" -R
+            fi
+          done
+
       - name: Apply Manifests (main)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
-          kubectl apply -f config/ingress/ -R
-          # config/app/ добавим позже
+          for DIR in config/service config/ingress; do
+            if [ -d "$DIR" ] && ls "$DIR"/*.yaml &>/dev/null; then
+              echo "Применяем $DIR"
+              kubectl apply -f "$DIR/" -R
+            else
+              echo "$DIR пуст, пропуск"
+            fi
+          done
 
       - name: Show Final State
         if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
         run: |
+          echo "Secrets:"
+          kubectl get secrets -A | grep -vE 'kube-|helm|default-token' || true
+          echo ""
+          echo "Services:"
+          kubectl get svc -A | grep -vE 'kube-|ingress-nginx|monitoring' || true
+          echo ""
+          echo "Ingress:"
           kubectl get ingress -A || true
-          kubectl get secrets -A | grep wildcard || true
+          echo ""
+          echo "Deployments (кроме системных):"
+          kubectl get deploy -A | grep -vE 'kube-|ingress-nginx|monitoring' || true

@@ -1,0 +1,187 @@
+# =============================================================================
+# Deploy: обновление образа приложения при публикации релиза
+# =============================================================================
+name: Deploy App
+
+on:
+  repository_dispatch:
+    types: [release-published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Версия образа'
+        required: true
+        type: string
+
+jobs:
+  deploy:
+    name: Deploy app to Kubernetes
+    runs-on: ubuntu-latest
+
+    env:
+      VERSION: ${{ github.event.client_payload.version || github.event.inputs.version }}
+      K8S_NAMESPACE: default
+      K8S_DEPLOYMENT: diplom-app
+      MANIFEST: config/app/deployment.yaml
+      SERVICE_MANIFEST: config/service/app.yaml
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ======================================================================
+      # Кэш утилит
+      # ======================================================================
+      - name: Cache YC CLI
+        id: cache-yc
+        uses: actions/cache@v4
+        with:
+          path: ~/yandex-cloud
+          key: ${{ runner.os }}-yc-cli-v1
+          restore-keys: ${{ runner.os }}-yc-cli-
+
+      - name: Install YC CLI
+        if: steps.cache-yc.outputs.cache-hit != 'true'
+        run: |
+          curl -sSL https://storage.yandexcloud.net/yandexcloud-yc/install.sh | \
+            bash -s -- -i $HOME/yandex-cloud -n
+
+      - name: Add YC CLI to PATH
+        run: echo "$HOME/yandex-cloud/bin" >> $GITHUB_PATH
+
+      - name: Cache kubectl
+        id: cache-kubectl
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/bin/kubectl
+          key: ${{ runner.os }}-kubectl-v1.31.0
+          restore-keys: ${{ runner.os }}-kubectl-
+
+      - name: Install kubectl
+        if: steps.cache-kubectl.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/.local/bin
+          curl -sSL -o ~/.local/bin/kubectl \
+            "https://storage.googleapis.com/kubernetes-release/release/v1.31.0/bin/linux/amd64/kubectl"
+          chmod +x ~/.local/bin/kubectl
+
+      - name: Add kubectl to PATH
+        run: echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Install envsubst
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gettext-base
+
+      # ======================================================================
+      # Kubeconfig
+      # ======================================================================
+      - name: Write Service Account Key
+        run: |
+          echo '${{ secrets.YC_SERVICE_ACCOUNT_KEY_B64 }}' | base64 -d > ${{ github.workspace }}/sa-key.json
+          chmod 600 ${{ github.workspace }}/sa-key.json
+
+      - name: Configure YC CLI
+        run: |
+          yc config profile create ci-profile
+          yc config set service-account-key ${{ github.workspace }}/sa-key.json
+          yc config set cloud-id ${{ secrets.YC_CLOUD_ID }}
+          yc config set folder-id ${{ secrets.YC_FOLDER_ID }}
+          yc config profile activate ci-profile
+
+      - name: Get Kubeconfig
+        run: |
+          CLUSTER_ID=$(yc managed-kubernetes cluster list --format json | jq -r '.[0].id')
+          yc managed-kubernetes cluster get-credentials --id "$CLUSTER_ID" --external --force
+          kubectl cluster-info
+
+      # ======================================================================
+      # Проверка Secret app-registry
+      # ======================================================================
+      - name: Ensure app-registry secret exists
+        run: |
+          if ! kubectl -n default get secret app-registry &>/dev/null; then
+            echo "Secret app-registry не найден, создаём"
+            kubectl -n default create secret generic app-registry \
+              --from-literal=registry-url="${{ secrets.REGISTRY_URL }}" \
+              --from-literal=image-name="devops-diplom-app"
+          else
+            echo "Secret app-registry уже существует"
+          fi
+
+      - name: Read registry info
+        id: registry
+        run: |
+          REGISTRY_URL=$(kubectl -n default get secret app-registry \
+            -o jsonpath='{.data.registry-url}' | base64 -d)
+          IMAGE_NAME=$(kubectl -n default get secret app-registry \
+            -o jsonpath='{.data.image-name}' | base64 -d)
+
+          if [ -z "$REGISTRY_URL" ] || [ -z "$IMAGE_NAME" ]; then
+            echo "ОШИБКА: Secret app-registry не содержит нужных ключей"
+            exit 1
+          fi
+
+          echo "registry_url=$REGISTRY_URL" >> $GITHUB_OUTPUT
+          echo "image_name=$IMAGE_NAME" >> $GITHUB_OUTPUT
+          echo "Registry URL: $REGISTRY_URL"
+          echo "Image name:   $IMAGE_NAME"
+
+      # ======================================================================
+      # Рендер манифеста через envsubst
+      # ======================================================================
+      - name: Render manifest
+        run: |
+          set -euo pipefail
+
+          export REGISTRY_URL="${{ steps.registry.outputs.registry_url }}"
+          export IMAGE_NAME="${{ steps.registry.outputs.image_name }}"
+          export IMAGE_TAG="${{ env.VERSION }}"
+
+          echo "Рендерим манифест:"
+          echo "  REGISTRY_URL = $REGISTRY_URL"
+          echo "  IMAGE_NAME   = $IMAGE_NAME"
+          echo "  IMAGE_TAG    = $IMAGE_TAG"
+
+          rm -rf /tmp/rendered
+          mkdir -p /tmp/rendered/app
+
+          envsubst < "${{ env.MANIFEST }}" > /tmp/rendered/app/deployment.yaml
+
+          echo ""
+          echo "Результат рендера (строка image):"
+          grep "image:" /tmp/rendered/app/deployment.yaml
+
+      # ======================================================================
+      # Применение в кластер
+      # ======================================================================
+      - name: Apply Service
+        run: |
+          kubectl apply -f "${{ env.SERVICE_MANIFEST }}"
+
+      - name: Apply Deployment
+        run: |
+          kubectl apply -f /tmp/rendered/app/deployment.yaml
+
+      - name: Wait for rollout
+        run: |
+          kubectl -n "${{ env.K8S_NAMESPACE }}" rollout status \
+            deployment/"${{ env.K8S_DEPLOYMENT }}" \
+            --timeout=5m
+
+      # ======================================================================
+      # Итоговое состояние
+      # ======================================================================
+      - name: Show final state
+        if: always()
+        run: |
+          echo "Deployment:"
+          kubectl -n "${{ env.K8S_NAMESPACE }}" get deployment "${{ env.K8S_DEPLOYMENT }}" -o wide || true
+          echo ""
+          echo "Поды приложения:"
+          kubectl -n "${{ env.K8S_NAMESPACE }}" get pods -l app="${{ env.K8S_DEPLOYMENT }}" || true
+          echo ""
+          echo "Текущий образ в кластере:"
+          kubectl -n "${{ env.K8S_NAMESPACE }}" get deployment "${{ env.K8S_DEPLOYMENT }}" \
+            -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true
+          echo ""
