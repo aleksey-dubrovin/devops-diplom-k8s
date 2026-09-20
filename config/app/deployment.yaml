@@ -18,6 +18,8 @@ spec:
       labels:
         app: diplom-app
     spec:
+      imagePullSecrets:
+        - name: yc-registry
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
