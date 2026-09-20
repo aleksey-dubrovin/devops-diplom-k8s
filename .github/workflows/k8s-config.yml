@@ -1,14 +1,6 @@
 # =============================================================================
 # Workflow для применения внутренних ресурсов кластера
 # =============================================================================
-# Применяет: config/secrets/, config/service/, config/ingress/
-# Не применяет: config/app/ (обрабатывается workflow deploy.yml)
-#
-# Триггеры:
-#   - PR в main при изменениях в config/secrets, config/service, config/ingress
-#   - push в main при изменениях в тех же каталогах
-#   - workflow_dispatch
-# =============================================================================
 name: K8s Manifests
 
 on:
@@ -38,6 +30,7 @@ jobs:
       SECRET_WILDCARD_TLS_CRT:       ${{ secrets.WILDCARD_TLS_CRT }}
       SECRET_WILDCARD_TLS_KEY:       ${{ secrets.WILDCARD_TLS_KEY }}
       SECRET_REGISTRY_URL:           ${{ secrets.REGISTRY_URL }}
+      SECRET_YC_SA_KEY_JSON:         ${{ secrets.YC_SERVICE_ACCOUNT_KEY_B64 }}
 
     steps:
       - name: Checkout code
@@ -104,6 +97,9 @@ jobs:
           yc managed-kubernetes cluster get-credentials --id "$CLUSTER_ID" --external --force
           kubectl cluster-info
 
+      # ======================================================================
+      # Создание Secret'ов из реестра
+      # ======================================================================
       - name: Create Secrets from Registry
         if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         run: |
@@ -131,7 +127,7 @@ jobs:
             TYPE=$(echo "$SECRET" | jq -r '.type // "Opaque"')
 
             echo ""
-            echo "Secret: $NAME (namespace: $NS)"
+            echo "Secret: $NAME (namespace: $NS, type: $TYPE)"
 
             if ! kubectl get ns "$NS" &>/dev/null; then
               echo "  namespace '$NS' не найден, пропуск"
@@ -139,6 +135,48 @@ jobs:
               continue
             fi
 
+            # ----------------------------------------------------------------
+            # Обработка типа docker-registry
+            # ----------------------------------------------------------------
+            if [ "$TYPE" = "docker-registry" ]; then
+              SERVER=$(echo "$SECRET" | jq -r '.server')
+              USERNAME=$(echo "$SECRET" | jq -r '.username')
+              PASSWORD_FROM_ENV=$(echo "$SECRET" | jq -r '.passwordFromEnv // empty')
+
+              if [ -z "$SERVER" ] || [ -z "$USERNAME" ] || [ -z "$PASSWORD_FROM_ENV" ]; then
+                echo "  не заданы server, username или passwordFromEnv, пропуск"
+                SKIPPED=$((SKIPPED+1))
+                continue
+              fi
+
+              VAR_NAME="SECRET_${PASSWORD_FROM_ENV}"
+              PASSWORD_B64="${!VAR_NAME:-}"
+              if [ -z "$PASSWORD_B64" ]; then
+                echo "  env $VAR_NAME пуст, пропуск"
+                SKIPPED=$((SKIPPED+1))
+                continue
+              fi
+
+              # Декодируем base64 в JSON-ключ
+              echo "$PASSWORD_B64" | base64 -d > /tmp/registry-password.json
+
+              kubectl create secret docker-registry "$NAME" \
+                -n "$NS" \
+                --docker-server="$SERVER" \
+                --docker-username="$USERNAME" \
+                --docker-password="$(cat /tmp/registry-password.json)" \
+                --dry-run=client -o yaml | kubectl apply -f -
+
+              rm -f /tmp/registry-password.json
+
+              echo "  создан как docker-registry"
+              CREATED=$((CREATED+1))
+              continue
+            fi
+
+            # ----------------------------------------------------------------
+            # Обработка остальных типов (Opaque, kubernetes.io/tls)
+            # ----------------------------------------------------------------
             ARGS=()
             while read -r KEY; do
               [ -z "$KEY" ] && continue
