@@ -10,6 +10,7 @@ on:
       - 'config/secrets/**'
       - 'config/service/**'
       - 'config/ingress/**'
+      - 'config/alerts/**'
       - '.github/workflows/k8s-config.yml'
   push:
     branches: [main]
@@ -17,6 +18,7 @@ on:
       - 'config/secrets/**'
       - 'config/service/**'
       - 'config/ingress/**'
+      - 'config/alerts/**'
       - '.github/workflows/k8s-config.yml'
   workflow_dispatch:
 
@@ -228,11 +230,12 @@ jobs:
       - name: Diff Manifests (PR)
         if: github.event_name == 'pull_request'
         run: |
-          for DIR in config/service config/ingress; do
+          for DIR in config/service config/ingress config/alerts; do
             if [ -d "$DIR" ] && ls "$DIR"/*.yaml &>/dev/null; then
-              echo "kubectl diff $DIR"
-              kubectl diff -f "$DIR/" -R || true
-              echo ""
+              echo "Применяем $DIR"
+              kubectl apply -f "$DIR/" -R
+            else
+              echo "$DIR пуст, пропуск"
             fi
           done
 
@@ -246,7 +249,7 @@ jobs:
       - name: Apply Manifests (main)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
-          for DIR in config/service config/ingress; do
+          for DIR in config/service config/ingress config/alerts; do
             if [ -d "$DIR" ] && ls "$DIR"/*.yaml &>/dev/null; then
               echo "Применяем $DIR"
               kubectl apply -f "$DIR/" -R
