@@ -55,6 +55,7 @@ grafana:
 alertmanager:
   enabled: true
   alertmanagerSpec:
+    configSecret: alertmanager-config
     storage: {}
     resources:
       requests:
@@ -70,23 +71,6 @@ alertmanager:
         labelSelector:
           matchLabels:
             app.kubernetes.io/instance: prometheus
-
-  config:
-    global:
-      resolve_timeout: 5m
-
-    route:
-      receiver: 'max-bot'
-      group_by: ['alertname', 'namespace', 'severity']
-      group_wait: 30s
-      group_interval: 5m
-      repeat_interval: 4h
-
-    receivers:
-      - name: 'max-bot'
-        webhook_configs:
-          - url: 'http://max-bot.monitoring.svc.cluster.local:8080/webhook'
-            send_resolved: true
 
 prometheusOperator:
   enabled: true
