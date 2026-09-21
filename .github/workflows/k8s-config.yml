@@ -31,6 +31,8 @@ jobs:
       SECRET_WILDCARD_TLS_KEY:       ${{ secrets.WILDCARD_TLS_KEY }}
       SECRET_REGISTRY_URL:           ${{ secrets.REGISTRY_URL }}
       SECRET_YC_SA_KEY_JSON:         ${{ secrets.YC_SERVICE_ACCOUNT_KEY_B64 }}
+      SECRET_MAX_BOT_TOKEN: ${{ secrets.MAX_BOT_TOKEN }}
+      SECRET_MAX_CHAT_ID:   ${{ secrets.MAX_CHAT_ID }}
 
     steps:
       - name: Checkout code

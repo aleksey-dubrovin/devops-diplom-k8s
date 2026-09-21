@@ -1,0 +1,61 @@
+# =============================================================================
+# Deployment MAX Bot
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: max-bot
+  namespace: monitoring
+  labels:
+    app: max-bot
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: max-bot
+  template:
+    metadata:
+      labels:
+        app: max-bot
+    spec:
+      imagePullSecrets:
+        - name: yc-registry
+      containers:
+        - name: max-bot
+          image: ${REGISTRY_URL}/${MAX_BOT_IMAGE_NAME}:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: MAX_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: max-bot-secret
+                  key: max-bot-token
+            - name: MAX_CHAT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: max-bot-secret
+                  key: max-chat-id
+            - name: PORT
+              value: "8080"
+          resources:
+            requests:
+              cpu: 30m
+              memory: 64Mi
+            limits:
+              cpu: 150m
+              memory: 192Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 20

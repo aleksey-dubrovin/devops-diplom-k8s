@@ -1,0 +1,18 @@
+# =============================================================================
+# Service для MAX Bot
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: max-bot
+  namespace: monitoring
+  labels:
+    app: max-bot
+spec:
+  type: ClusterIP
+  selector:
+    app: max-bot
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
