@@ -1,5 +1,5 @@
 # =============================================================================
-# Deploy: обновление образа приложения при публикации релиза
+# Deploy: рендер манифестов через envsubst и применение в кластер
 # =============================================================================
 name: Deploy App
 
@@ -9,29 +9,22 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Версия образа'
+        description: 'Версия образа diplom-app (например, v1.0.0)'
         required: true
         type: string
 
 jobs:
   deploy:
-    name: Deploy app to Kubernetes
+    name: Deploy to Kubernetes
     runs-on: ubuntu-latest
 
     env:
       VERSION: ${{ github.event.client_payload.version || github.event.inputs.version }}
-      K8S_NAMESPACE: default
-      K8S_DEPLOYMENT: diplom-app
-      MANIFEST: config/app/deployment.yaml
-      SERVICE_MANIFEST: config/service/app.yaml
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # ======================================================================
-      # Кэш утилит
-      # ======================================================================
       - name: Cache YC CLI
         id: cache-yc
         uses: actions/cache@v4
@@ -73,9 +66,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gettext-base
 
-      # ======================================================================
-      # Kubeconfig
-      # ======================================================================
       - name: Write Service Account Key
         run: |
           echo '${{ secrets.YC_SERVICE_ACCOUNT_KEY_B64 }}' | base64 -d > ${{ github.workspace }}/sa-key.json
@@ -104,7 +94,8 @@ jobs:
             echo "Secret app-registry не найден, создаём"
             kubectl -n default create secret generic app-registry \
               --from-literal=registry-url="${{ secrets.REGISTRY_URL }}" \
-              --from-literal=image-name="devops-diplom-app"
+              --from-literal=diplom-app-image-name="devops-diplom-app" \
+              --from-literal=max-bot-image-name="max-bot"
           else
             echo "Secret app-registry уже существует"
           fi
@@ -114,60 +105,69 @@ jobs:
         run: |
           REGISTRY_URL=$(kubectl -n default get secret app-registry \
             -o jsonpath='{.data.registry-url}' | base64 -d)
-          IMAGE_NAME=$(kubectl -n default get secret app-registry \
-            -o jsonpath='{.data.image-name}' | base64 -d)
+          DIPLOM_APP_IMAGE_NAME=$(kubectl -n default get secret app-registry \
+            -o jsonpath='{.data.diplom-app-image-name}' | base64 -d)
+          MAX_BOT_IMAGE_NAME=$(kubectl -n default get secret app-registry \
+            -o jsonpath='{.data.max-bot-image-name}' | base64 -d)
 
-          if [ -z "$REGISTRY_URL" ] || [ -z "$IMAGE_NAME" ]; then
+          if [ -z "$REGISTRY_URL" ] || [ -z "$DIPLOM_APP_IMAGE_NAME" ] || [ -z "$MAX_BOT_IMAGE_NAME" ]; then
             echo "ОШИБКА: Secret app-registry не содержит нужных ключей"
             exit 1
           fi
 
           echo "registry_url=$REGISTRY_URL" >> $GITHUB_OUTPUT
-          echo "image_name=$IMAGE_NAME" >> $GITHUB_OUTPUT
-          echo "Registry URL: $REGISTRY_URL"
-          echo "Image name:   $IMAGE_NAME"
+          echo "diplom_app_image_name=$DIPLOM_APP_IMAGE_NAME" >> $GITHUB_OUTPUT
+          echo "max_bot_image_name=$MAX_BOT_IMAGE_NAME" >> $GITHUB_OUTPUT
+
+          echo "REGISTRY_URL:          $REGISTRY_URL"
+          echo "DIPLOM_APP_IMAGE_NAME: $DIPLOM_APP_IMAGE_NAME"
+          echo "MAX_BOT_IMAGE_NAME:    $MAX_BOT_IMAGE_NAME"
 
       # ======================================================================
-      # Рендер манифеста через envsubst
+      # Рендер всех манифестов из config/app/
       # ======================================================================
-      - name: Render manifest
+      - name: Render manifests
         run: |
           set -euo pipefail
 
           export REGISTRY_URL="${{ steps.registry.outputs.registry_url }}"
-          export IMAGE_NAME="${{ steps.registry.outputs.image_name }}"
+          export DIPLOM_APP_IMAGE_NAME="${{ steps.registry.outputs.diplom_app_image_name }}"
+          export MAX_BOT_IMAGE_NAME="${{ steps.registry.outputs.max_bot_image_name }}"
           export IMAGE_TAG="${{ env.VERSION }}"
 
-          echo "Рендерим манифест:"
-          echo "  REGISTRY_URL = $REGISTRY_URL"
-          echo "  IMAGE_NAME   = $IMAGE_NAME"
-          echo "  IMAGE_TAG    = $IMAGE_TAG"
+          echo "Параметры рендера:"
+          echo "  REGISTRY_URL          = $REGISTRY_URL"
+          echo "  DIPLOM_APP_IMAGE_NAME = $DIPLOM_APP_IMAGE_NAME"
+          echo "  MAX_BOT_IMAGE_NAME    = $MAX_BOT_IMAGE_NAME"
+          echo "  IMAGE_TAG             = $IMAGE_TAG"
 
           rm -rf /tmp/rendered
-          mkdir -p /tmp/rendered/app
+          mkdir -p /tmp/rendered
 
-          envsubst < "${{ env.MANIFEST }}" > /tmp/rendered/app/deployment.yaml
+          for FILE in config/app/*.yaml; do
+            OUT="/tmp/rendered/$(basename "$FILE")"
+            envsubst < "$FILE" > "$OUT"
+            echo "Rendered: $OUT"
+          done
 
           echo ""
-          echo "Результат рендера (строка image):"
-          grep "image:" /tmp/rendered/app/deployment.yaml
+          echo "Проверка строк image:"
+          grep "image:" /tmp/rendered/*.yaml || true
 
       # ======================================================================
       # Применение в кластер
       # ======================================================================
-      - name: Apply Service
+      - name: Apply deployments
         run: |
-          kubectl apply -f "${{ env.SERVICE_MANIFEST }}"
+          kubectl apply -f /tmp/rendered/
 
-      - name: Apply Deployment
+      - name: Wait for diplom-app rollout
         run: |
-          kubectl apply -f /tmp/rendered/app/deployment.yaml
+          kubectl -n default rollout status deployment/diplom-app --timeout=3m
 
-      - name: Wait for rollout
+      - name: Wait for max-bot rollout
         run: |
-          kubectl -n "${{ env.K8S_NAMESPACE }}" rollout status \
-            deployment/"${{ env.K8S_DEPLOYMENT }}" \
-            --timeout=5m
+          kubectl -n monitoring rollout status deployment/max-bot --timeout=3m || true
 
       # ======================================================================
       # Итоговое состояние
@@ -175,13 +175,14 @@ jobs:
       - name: Show final state
         if: always()
         run: |
-          echo "Deployment:"
-          kubectl -n "${{ env.K8S_NAMESPACE }}" get deployment "${{ env.K8S_DEPLOYMENT }}" -o wide || true
+          echo "Deployments (default):"
+          kubectl -n default get deploy || true
           echo ""
-          echo "Поды приложения:"
-          kubectl -n "${{ env.K8S_NAMESPACE }}" get pods -l app="${{ env.K8S_DEPLOYMENT }}" || true
+          echo "Deployments (monitoring):"
+          kubectl -n monitoring get deploy | grep -vE 'prometheus|grafana|kube' || true
           echo ""
-          echo "Текущий образ в кластере:"
-          kubectl -n "${{ env.K8S_NAMESPACE }}" get deployment "${{ env.K8S_DEPLOYMENT }}" \
-            -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true
+          echo "Поды diplom-app:"
+          kubectl -n default get pods -l app=diplom-app || true
           echo ""
+          echo "Поды max-bot:"
+          kubectl -n monitoring get pods -l app=max-bot || true

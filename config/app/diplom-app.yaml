@@ -1,5 +1,5 @@
 # =============================================================================
-# Deployment тестового приложения
+# Deployment приложения diplom-app
 # =============================================================================
 apiVersion: apps/v1
 kind: Deployment
@@ -31,7 +31,7 @@ spec:
                 topologyKey: kubernetes.io/hostname
       containers:
         - name: app
-          image: ${REGISTRY_URL}/${IMAGE_NAME}:${IMAGE_TAG}
+          image: ${REGISTRY_URL}/${DIPLOM_APP_IMAGE_NAME}:${IMAGE_TAG}
           imagePullPolicy: Always
           ports:
             - name: http
