@@ -1,7 +1,7 @@
 # =============================================================================
 # Workflow для применения внутренних ресурсов кластера
 # =============================================================================
-name: K8s Manifests
+name: K8s Config
 
 on:
   pull_request:
@@ -10,7 +10,7 @@ on:
       - 'config/secrets/**'
       - 'config/service/**'
       - 'config/ingress/**'
-      - 'config/alerts/**'
+      - 'monitoring/**'
       - '.github/workflows/k8s-config.yml'
   push:
     branches: [main]
@@ -18,7 +18,7 @@ on:
       - 'config/secrets/**'
       - 'config/service/**'
       - 'config/ingress/**'
-      - 'config/alerts/**'
+      - 'monitoring/**'
       - '.github/workflows/k8s-config.yml'
   workflow_dispatch:
 
@@ -33,8 +33,8 @@ jobs:
       SECRET_WILDCARD_TLS_KEY:       ${{ secrets.WILDCARD_TLS_KEY }}
       SECRET_REGISTRY_URL:           ${{ secrets.REGISTRY_URL }}
       SECRET_YC_SA_KEY_JSON:         ${{ secrets.YC_SERVICE_ACCOUNT_KEY_B64 }}
-      SECRET_MAX_BOT_TOKEN: ${{ secrets.MAX_BOT_TOKEN }}
-      SECRET_MAX_CHAT_ID:   ${{ secrets.MAX_CHAT_ID }}
+      SECRET_MAX_BOT_TOKEN:          ${{ secrets.MAX_BOT_TOKEN }}
+      SECRET_MAX_CHAT_ID:            ${{ secrets.MAX_CHAT_ID }}
 
     steps:
       - name: Checkout code
@@ -139,9 +139,6 @@ jobs:
               continue
             fi
 
-            # ----------------------------------------------------------------
-            # Обработка типа docker-registry
-            # ----------------------------------------------------------------
             if [ "$TYPE" = "docker-registry" ]; then
               SERVER=$(echo "$SECRET" | jq -r '.server')
               USERNAME=$(echo "$SECRET" | jq -r '.username')
@@ -161,7 +158,6 @@ jobs:
                 continue
               fi
 
-              # Декодируем base64 в JSON-ключ
               echo "$PASSWORD_B64" | base64 -d > /tmp/registry-password.json
 
               kubectl create secret docker-registry "$NAME" \
@@ -178,9 +174,6 @@ jobs:
               continue
             fi
 
-            # ----------------------------------------------------------------
-            # Обработка остальных типов (Opaque, kubernetes.io/tls)
-            # ----------------------------------------------------------------
             ARGS=()
             while read -r KEY; do
               [ -z "$KEY" ] && continue
@@ -219,6 +212,28 @@ jobs:
           echo ""
           echo "Итог: создано $CREATED, пропущено $SKIPPED"
 
+      # ======================================================================
+      # Secret alertmanager-config из monitoring/alertmanager.yaml
+      # ======================================================================
+      # Файл monitoring/alertmanager.yaml не является Kubernetes-манифестом,
+      # поэтому применяется не через kubectl apply, а через создание Secret
+      # под ключом alertmanager.yaml (этого требует Prometheus Operator).
+      # ======================================================================
+      - name: Create Alertmanager Config Secret
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        run: |
+          SRC=monitoring/alertmanager.yaml
+          if [ ! -f "$SRC" ]; then
+            echo "Файл $SRC не найден, пропуск"
+            exit 0
+          fi
+
+          kubectl -n monitoring create secret generic alertmanager-config \
+            --from-file=alertmanager.yaml="$SRC" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          echo "Secret alertmanager-config создан или обновлён из $SRC"
+
       - name: Restart Grafana on Secret Update
         if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         run: |
@@ -227,15 +242,17 @@ jobs:
             kubectl rollout status deployment prometheus-grafana -n monitoring --timeout=2m
           fi
 
+      # ======================================================================
+      # PR: diff и dry-run
+      # ======================================================================
       - name: Diff Manifests (PR)
         if: github.event_name == 'pull_request'
         run: |
-          for DIR in config/service config/ingress config/alerts; do
+          for DIR in config/service config/ingress; do
             if [ -d "$DIR" ] && ls "$DIR"/*.yaml &>/dev/null; then
-              echo "Применяем $DIR"
-              kubectl apply -f "$DIR/" -R
-            else
-              echo "$DIR пуст, пропуск"
+              echo "kubectl diff $DIR"
+              kubectl diff -f "$DIR/" -R || true
+              echo ""
             fi
           done
 
@@ -246,10 +263,13 @@ jobs:
             fi
           done
 
+      # ======================================================================
+      # Main: apply
+      # ======================================================================
       - name: Apply Manifests (main)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
-          for DIR in config/service config/ingress config/alerts; do
+          for DIR in config/service config/ingress; do
             if [ -d "$DIR" ] && ls "$DIR"/*.yaml &>/dev/null; then
               echo "Применяем $DIR"
               kubectl apply -f "$DIR/" -R
@@ -258,6 +278,9 @@ jobs:
             fi
           done
 
+      # ======================================================================
+      # Итоговое состояние
+      # ======================================================================
       - name: Show Final State
         if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
         run: |
@@ -270,5 +293,5 @@ jobs:
           echo "Ingress:"
           kubectl get ingress -A || true
           echo ""
-          echo "Deployments (кроме системных):"
+          echo "Deployments:"
           kubectl get deploy -A | grep -vE 'kube-|ingress-nginx|monitoring' || true
